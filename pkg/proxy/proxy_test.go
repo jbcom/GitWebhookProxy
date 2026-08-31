@@ -10,7 +10,7 @@ import (
 
 	httpmock "github.com/jarcoal/httpmock"
 	"github.com/julienschmidt/httprouter"
-	"github.com/stakater/GitWebhookProxy/pkg/providers"
+	"github.com/jbcom/GitWebhookProxy/pkg/providers"
 )
 
 const (
