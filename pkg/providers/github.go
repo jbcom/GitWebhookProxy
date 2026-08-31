@@ -50,11 +50,31 @@ func NewGithubProvider(secret string) (*GithubProvider, error) {
 	}, nil
 }
 
+// GetOptionalHeaderKeys forwards whichever signature headers are present.
+//
+// BOTH SIGNATURE HEADERS ARE OPTIONAL AT THE PARSER, and enforcement moves to
+// `Validate`, which is the only place that can express the real rule: at least
+// ONE of them, and if the strong one is there it decides.
+//
+// Requiring either at the parser is wrong in a different direction each way.
+// Requiring SHA-256 rejects GitLab and older GitHub Enterprise, which send
+// SHA-1 alone — the very deliveries the fallback exists for. Requiring SHA-1
+// rejects a sender that has dropped the legacy header, which is where GitHub is
+// heading. Neither is a rule about the request; both are a rule about
+// signatures, so both belong with the signature check.
+//
+// Nothing is weakened: a request with no signature at all still fails, one
+// step later, in `Validate`.
+func (p *GithubProvider) GetOptionalHeaderKeys() []string {
+	if len(strings.TrimSpace(p.secret)) > 0 {
+		return []string{XHubSignature, XHubSignature256}
+	}
+	return nil
+}
+
 func (p *GithubProvider) GetHeaderKeys() []string {
 	if len(strings.TrimSpace(p.secret)) > 0 {
 		return []string{
-			XHubSignature,
-			XHubSignature256,
 			XGitHubDelivery,
 			XGitHubEvent,
 			ContentTypeHeader,

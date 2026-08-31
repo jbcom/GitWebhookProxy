@@ -34,6 +34,12 @@ func (p *GitlabProvider) GetProviderName() string {
 }
 
 // Not adding XGitlabToken will make token validation optional
+// GetOptionalHeaderKeys is empty: GitLab sends exactly one token header and it
+// is required, so there is nothing conditional to forward.
+func (p *GitlabProvider) GetOptionalHeaderKeys() []string {
+	return nil
+}
+
 func (p *GitlabProvider) GetHeaderKeys() []string {
 	if len(strings.TrimSpace(p.secret)) > 0 {
 		return []string{
