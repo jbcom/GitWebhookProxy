@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/julienschmidt/httprouter"
-	"github.com/stakater/GitWebhookProxy/pkg/parser"
-	"github.com/stakater/GitWebhookProxy/pkg/providers"
-	"github.com/stakater/GitWebhookProxy/pkg/utils"
+	"github.com/jbcom/GitWebhookProxy/pkg/parser"
+	"github.com/jbcom/GitWebhookProxy/pkg/providers"
+	"github.com/jbcom/GitWebhookProxy/pkg/utils"
 )
 
 var (
