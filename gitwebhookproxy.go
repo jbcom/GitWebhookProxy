@@ -53,7 +53,10 @@ func main() {
 	}
 
 	log.Printf("Stakater Git WebHook Proxy started with provider '%s'\n", lowerProvider)
-	p, err := proxy.NewProxy(*upstreamURL, allowedPathsArray, lowerProvider, *secret, ignoredUsersArray)
+	// The downstream trigger token is intentionally environment-only. A command
+	// line is visible in process listings and often captured by deployment logs.
+	upstreamBearerToken := os.Getenv("GWP_UPSTREAMTOKEN")
+	p, err := proxy.NewProxyWithUpstreamBearerToken(*upstreamURL, allowedPathsArray, lowerProvider, *secret, ignoredUsersArray, upstreamBearerToken)
 	if err != nil {
 		log.Fatal(err)
 	}

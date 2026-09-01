@@ -36,6 +36,7 @@ GitWebhookProxy can be configured by providing the following arguments either vi
 | listenAddress | Address on which the proxy listens.                                               | `:8080`  | `127.0.0.1:80`                             |
 | upstreamURL   | URL to which the proxy requests will be forwarded (required)                      |          | `https://someci-instance-url.com/webhook/` |
 | secret        | Secret of the Webhook API. If not set validation is not made.                     |          | `iamasecret`                               |
+| upstreamToken | Optional **environment-only** bearer token injected into the upstream `Authorization` header only after a configured webhook HMAC validates. Configure it as `GWP_UPSTREAMTOKEN`; do not put it in a URL, command line, log, or repository. It must not equal `secret`. | | supplied by the runtime secret manager |
 | provider      | Git Provider which generates the Webhook                                          | `github` | `github` or `gitlab`                       |
 | allowedPaths  | Comma-Separated String List of allowed paths on the proxy                         |          | `/project` or `github-webhook/,project/`   |
 | ignoredUsers  | Comma-Separated String List of users to ignore while proxying Webhook request     |          | `someuser`                                 |
@@ -132,6 +133,18 @@ jenkinswebhookproxy:
 ```
 
 ## Troubleshooting
+
+### Relaying to a Jenkins Generic Webhook Trigger endpoint
+
+When Jenkins does not grant anonymous `Job/Read`, configure a **separate**
+relay-to-Jenkins trigger token with `GWP_UPSTREAMTOKEN`. GitWebhookProxy sends
+it only as `Authorization: Bearer …` after it has authenticated the original
+provider delivery with `GWP_SECRET`. The two values have different purposes and
+must never be reused: `GWP_SECRET` verifies GitHub/GitLab, while the upstream
+token permits Jenkins to locate a configured webhook job. Keep both in the
+runtime secret manager; do not use a query parameter, command-line argument,
+build artifact, or repository file for either value.
+
 ### 405 Method Not Allowed with Jenkins & github plugin
 If you get the following error when setting up webhooks for your jobs in Jenkins, make sure you have the trailing `/` in the webhook configured in Jenkins. 
 ```

@@ -3,9 +3,11 @@ package proxy
 import (
 	"bytes"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	httpmock "github.com/jarcoal/httpmock"
@@ -500,6 +502,187 @@ func createGithubRequestWithoutSignature(method string, path string,
 	req.Header.Add(providers.XGitHubDelivery, "test-delivery")
 	req.Header.Add(providers.ContentTypeHeader, providers.DefaultContentTypeHeaderValue)
 	return req
+}
+
+func createSignedGithubRequest(method string, path, eventHeader, secret string, body []byte) *http.Request {
+	req := createGithubRequestWithoutSignature(method, path, eventHeader, body)
+	req.Header.Set(
+		providers.XHubSignature256,
+		providers.Signature256Prefix+providers.HashPayload256(secret, body),
+	)
+	return req
+}
+
+func TestProxy_proxyRequestInjectsUpstreamBearerOnlyAfterValidHMAC(t *testing.T) {
+	const upstreamBearerToken = "jenkins-relay-test-token"
+	payload := []byte(`{"sender":{"login":"trusted-sender"}}`)
+
+	type upstreamRequest struct {
+		authorization string
+		rawQuery      string
+	}
+	received := make(chan upstreamRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- upstreamRequest{
+			authorization: r.Header.Get("Authorization"),
+			rawQuery:      r.URL.RawQuery,
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	p, err := NewProxyWithUpstreamBearerToken(
+		upstream.URL,
+		[]string{"/generic-webhook-trigger/invoke"},
+		providers.GithubProviderKind,
+		proxyGithubTestSecret,
+		nil,
+		upstreamBearerToken,
+	)
+	if err != nil {
+		t.Fatalf("NewProxyWithUpstreamBearerToken() error = %v", err)
+	}
+	router := httprouter.New()
+	router.POST("/*path", p.proxyRequest)
+
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, createSignedGithubRequest(
+		http.MethodPost,
+		"/generic-webhook-trigger/invoke",
+		proxyGithubTestEvent,
+		proxyGithubTestSecret,
+		payload,
+	))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("valid HMAC status = %d, want %d", rr.Code, http.StatusNoContent)
+	}
+
+	select {
+	case request := <-received:
+		if request.authorization != "Bearer "+upstreamBearerToken {
+			t.Fatalf("upstream Authorization = %q, want exact bearer token", request.authorization)
+		}
+		if request.rawQuery != "" {
+			t.Fatalf("upstream query = %q, bearer token must never be query-string transport", request.rawQuery)
+		}
+	default:
+		t.Fatal("valid HMAC delivery did not reach upstream")
+	}
+}
+
+func TestProxy_proxyRequestRejectsInvalidHMACWithoutBearerOrLeak(t *testing.T) {
+	const upstreamBearerToken = "jenkins-relay-test-token"
+	payload := []byte(`{"sender":{"login":"attacker"}}`)
+
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	p, err := NewProxyWithUpstreamBearerToken(
+		upstream.URL,
+		[]string{"/generic-webhook-trigger/invoke"},
+		providers.GithubProviderKind,
+		proxyGithubTestSecret,
+		nil,
+		upstreamBearerToken,
+	)
+	if err != nil {
+		t.Fatalf("NewProxyWithUpstreamBearerToken() error = %v", err)
+	}
+
+	var logs bytes.Buffer
+	previousOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+
+	router := httprouter.New()
+	router.POST("/*path", p.proxyRequest)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, createSignedGithubRequest(
+		http.MethodPost,
+		"/generic-webhook-trigger/invoke",
+		proxyGithubTestEvent,
+		"wrong-source-hmac",
+		payload,
+	))
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid HMAC status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("invalid HMAC reached upstream %d times", upstreamCalls)
+	}
+	if strings.Contains(rr.Body.String(), upstreamBearerToken) || strings.Contains(logs.String(), upstreamBearerToken) {
+		t.Fatal("downstream bearer token leaked through a rejected webhook")
+	}
+}
+
+func TestProxy_proxyRequestRedactsBearerWhenUpstreamFails(t *testing.T) {
+	const upstreamBearerToken = "jenkins-relay-test-token"
+	payload := []byte(`{"sender":{"login":"trusted-sender"}}`)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+upstreamBearerToken {
+			t.Errorf("upstream Authorization = %q, want exact bearer token", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+
+	p, err := NewProxyWithUpstreamBearerToken(
+		upstream.URL,
+		[]string{"/generic-webhook-trigger/invoke"},
+		providers.GithubProviderKind,
+		proxyGithubTestSecret,
+		nil,
+		upstreamBearerToken,
+	)
+	if err != nil {
+		t.Fatalf("NewProxyWithUpstreamBearerToken() error = %v", err)
+	}
+
+	var logs bytes.Buffer
+	previousOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+
+	router := httprouter.New()
+	router.POST("/*path", p.proxyRequest)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, createSignedGithubRequest(
+		http.MethodPost,
+		"/generic-webhook-trigger/invoke",
+		proxyGithubTestEvent,
+		proxyGithubTestSecret,
+		payload,
+	))
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("upstream failure status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+	if strings.Contains(rr.Body.String(), upstreamBearerToken) || strings.Contains(logs.String(), upstreamBearerToken) {
+		t.Fatal("downstream bearer token leaked through an upstream failure")
+	}
+}
+
+func TestNewProxyWithUpstreamBearerTokenRequiresWebhookHMAC(t *testing.T) {
+	_, err := NewProxyWithUpstreamBearerToken(
+		"https://jenkins.example.test",
+		[]string{"/generic-webhook-trigger/invoke"},
+		providers.GithubProviderKind,
+		"",
+		nil,
+		"jenkins-relay-test-token",
+	)
+	if err == nil {
+		t.Fatal("downstream bearer token without a webhook HMAC secret was accepted")
+	}
+	if strings.Contains(err.Error(), "jenkins-relay-test-token") {
+		t.Fatalf("configuration error leaked downstream bearer token: %v", err)
+	}
 }
 
 func createRequestWithWrongHeadersKeys(method string, path string, tokenHeader string,

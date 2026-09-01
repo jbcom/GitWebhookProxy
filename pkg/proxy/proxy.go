@@ -30,12 +30,13 @@ var (
 )
 
 type Proxy struct {
-	provider     string
-	upstreamURL  string
-	allowedPaths []string
-	secret       string
-	ignoredUsers []string
-	allowedUsers []string
+	provider            string
+	upstreamURL         string
+	allowedPaths        []string
+	secret              string
+	upstreamBearerToken string
+	ignoredUsers        []string
+	allowedUsers        []string
 }
 
 func (p *Proxy) isPathAllowed(path string) bool {
@@ -84,6 +85,13 @@ func (p *Proxy) isAllowedUser(committer string) bool {
 }
 
 func (p *Proxy) redirect(hook *providers.Hook, redirectURL string) (*http.Response, error) {
+	return p.redirectAuthenticated(hook, redirectURL, "")
+}
+
+// redirectAuthenticated forwards a delivery only after proxyRequest has
+// verified its provider signature. The downstream bearer is deliberately not
+// derived from, or shared with, the provider webhook HMAC secret.
+func (p *Proxy) redirectAuthenticated(hook *providers.Hook, redirectURL, bearerToken string) (*http.Response, error) {
 	if hook == nil {
 		return nil, errors.New("Cannot redirect with nil Hook")
 	}
@@ -109,6 +117,11 @@ func (p *Proxy) redirect(hook *providers.Hook, redirectURL string) (*http.Respon
 	// Set Headers from hook
 	for key, value := range hook.Headers {
 		req.Header.Add(key, value)
+	}
+	if bearerToken != "" {
+		// Set rather than Add so an untrusted inbound Authorization value cannot
+		// survive parser changes and take precedence at the upstream.
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
 	}
 
 	return httpClient.Do(req)
@@ -166,7 +179,8 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, params http
 	// The committer name is read from the PAYLOAD, and the payload is only
 	// trustworthy after the signature says so. Deciding anything on it first —
 	// including deciding to ignore it — is deciding on attacker-supplied data.
-	if len(strings.TrimSpace(p.secret)) > 0 && !provider.Validate(*hook) {
+	validated := len(strings.TrimSpace(p.secret)) > 0
+	if validated && !provider.Validate(*hook) {
 		log.Printf("Error Validating Hook for '%s'", r.URL)
 		http.Error(w, "Error validating Hook", http.StatusBadRequest)
 		return
@@ -181,12 +195,21 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, params http
 		return
 	}
 
-	resp, errs := p.redirect(hook, redirectURL)
+	var resp *http.Response
+	var errs error
+	if validated {
+		// This is the sole injection point for the relay-to-upstream credential.
+		// It is reached only after a configured provider HMAC validates.
+		resp, errs = p.redirectAuthenticated(hook, redirectURL, p.upstreamBearerToken)
+	} else {
+		resp, errs = p.redirect(hook, redirectURL)
+	}
 	if errs != nil {
 		log.Printf("Error Redirecting '%s' to upstream '%s': %s\n", r.URL, redirectURL, errs)
 		http.Error(w, "Error Redirecting '"+r.URL.String()+"' to upstream '"+redirectURL+"'", http.StatusInternalServerError)
 		return
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		log.Printf("Error Redirecting '%s' to upstream '%s', Upstream Redirect Status: %s\n", r.URL, redirectURL, resp.Status)
@@ -230,6 +253,20 @@ func (p *Proxy) Run(listenAddress string) error {
 
 func NewProxy(upstreamURL string, allowedPaths []string,
 	provider string, secret string, ignoredUsers []string) (*Proxy, error) {
+	return newProxy(upstreamURL, allowedPaths, provider, secret, ignoredUsers, "")
+}
+
+// NewProxyWithUpstreamBearerToken creates a proxy which presents a separate
+// bearer token to its upstream only after a provider HMAC validates. The
+// original NewProxy API intentionally remains available for relays which do
+// not need downstream authentication.
+func NewProxyWithUpstreamBearerToken(upstreamURL string, allowedPaths []string,
+	provider string, secret string, ignoredUsers []string, upstreamBearerToken string) (*Proxy, error) {
+	return newProxy(upstreamURL, allowedPaths, provider, secret, ignoredUsers, upstreamBearerToken)
+}
+
+func newProxy(upstreamURL string, allowedPaths []string,
+	provider string, secret string, ignoredUsers []string, upstreamBearerToken string) (*Proxy, error) {
 	// Validate Params
 	if len(strings.TrimSpace(upstreamURL)) == 0 {
 		return nil, errors.New("Cannot create Proxy with empty upstreamURL")
@@ -240,12 +277,16 @@ func NewProxy(upstreamURL string, allowedPaths []string,
 	if allowedPaths == nil {
 		return nil, errors.New("Cannot create Proxy with nil allowedPaths")
 	}
+	if strings.TrimSpace(upstreamBearerToken) != "" && strings.TrimSpace(secret) == "" {
+		return nil, errors.New("Cannot configure upstream bearer token without a webhook secret")
+	}
 
 	return &Proxy{
-		provider:     provider,
-		upstreamURL:  upstreamURL,
-		allowedPaths: allowedPaths,
-		secret:       secret,
-		ignoredUsers: ignoredUsers,
+		provider:            provider,
+		upstreamURL:         upstreamURL,
+		allowedPaths:        allowedPaths,
+		secret:              secret,
+		upstreamBearerToken: upstreamBearerToken,
+		ignoredUsers:        ignoredUsers,
 	}, nil
 }
