@@ -91,6 +91,20 @@ spec:
             {{- else }}
               name: {{ template "gitwebhookproxy.name" . }}
             {{- end }}
+        - name: GWP_UPSTREAMTOKEN
+          valueFrom:
+            secretKeyRef:
+              key: upstreamToken
+            {{- if .Values.gitWebhookProxy.existingSecretName }}
+              name: {{ .Values.gitWebhookProxy.existingSecretName }}
+              # A legacy externally managed Secret may only contain the
+              # webhook HMAC. An absent bearer leaves relay injection disabled.
+              optional: true
+            {{- else if .Values.gitWebhookProxy.useCustomName }}
+              name: {{ .Values.gitWebhookProxy.customName }}
+            {{- else }}
+              name: {{ template "gitwebhookproxy.name" . }}
+            {{- end }}
         image: "{{ .Values.gitWebhookProxy.image.name }}:{{ .Values.gitWebhookProxy.image.tag }}"
         imagePullPolicy: {{ .Values.gitWebhookProxy.image.pullPolicy }}
         {{- with .Values.gitWebhookProxy.securityContext }}

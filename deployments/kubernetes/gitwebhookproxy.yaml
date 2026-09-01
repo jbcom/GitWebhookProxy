@@ -93,6 +93,11 @@ spec:
             secretKeyRef:
               key: secret
               name: gitwebhookproxy
+        - name: GWP_UPSTREAMTOKEN
+          valueFrom:
+            secretKeyRef:
+              key: upstreamToken
+              name: gitwebhookproxy
         image: "stakater/gitwebhookproxy:v0.2.80"
         imagePullPolicy: IfNotPresent
         securityContext: 
@@ -142,6 +147,7 @@ metadata:
   name: gitwebhookproxy
 data:
     secret: ""
+    upstreamToken: ""
 
 ---
 # Source: gitwebhookproxy/templates/service.yaml

@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -19,23 +18,25 @@ import (
 )
 
 var (
-	transport = &http.Transport{
-		Proxy:           http.ProxyFromEnvironment,
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
+	// Use the standard transport unchanged so HTTPS upstream connections verify
+	// both the certificate chain and hostname. A relay bearer must never cross
+	// an unverified TLS connection.
+	transport  = http.DefaultTransport.(*http.Transport).Clone()
 	httpClient = &http.Client{
 		Timeout:   time.Second * 30,
 		Transport: transport,
 	}
+	errUnsafeBearerRedirect = errors.New("redirect target is not a bearer-safe upstream")
 )
 
 type Proxy struct {
-	provider     string
-	upstreamURL  string
-	allowedPaths []string
-	secret       string
-	ignoredUsers []string
-	allowedUsers []string
+	provider            string
+	upstreamURL         string
+	allowedPaths        []string
+	secret              string
+	upstreamBearerToken string
+	ignoredUsers        []string
+	allowedUsers        []string
 }
 
 func (p *Proxy) isPathAllowed(path string) bool {
@@ -84,6 +85,13 @@ func (p *Proxy) isAllowedUser(committer string) bool {
 }
 
 func (p *Proxy) redirect(hook *providers.Hook, redirectURL string) (*http.Response, error) {
+	return p.redirectAuthenticated(hook, redirectURL, "")
+}
+
+// redirectAuthenticated forwards a delivery only after proxyRequest has
+// verified its provider signature. The downstream bearer is deliberately not
+// derived from, or shared with, the provider webhook HMAC secret.
+func (p *Proxy) redirectAuthenticated(hook *providers.Hook, redirectURL, bearerToken string) (*http.Response, error) {
 	if hook == nil {
 		return nil, errors.New("Cannot redirect with nil Hook")
 	}
@@ -110,9 +118,52 @@ func (p *Proxy) redirect(hook *providers.Hook, redirectURL string) (*http.Respon
 	for key, value := range hook.Headers {
 		req.Header.Add(key, value)
 	}
+	if bearerToken != "" {
+		if !isBearerSafeUpstream(url) {
+			return nil, errUnsafeBearerRedirect
+		}
+		// Set rather than Add so an untrusted inbound Authorization value cannot
+		// survive parser changes and take precedence at the upstream.
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+		return bearerSafeHTTPClient().Do(req)
+	}
 
 	return httpClient.Do(req)
 
+}
+
+// bearerSafeHTTPClient rejects a redirect before the destination receives a
+// request when it is not a bearer-safe upstream. The initial request is
+// validated in redirectAuthenticated; CheckRedirect covers every later hop.
+func bearerSafeHTTPClient() *http.Client {
+	client := *httpClient
+	previousCheckRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !isBearerSafeRedirect(req.URL, via) {
+			return errUnsafeBearerRedirect
+		}
+		if previousCheckRedirect != nil {
+			return previousCheckRedirect(req, via)
+		}
+		return nil
+	}
+	return &client
+}
+
+func isBearerSafeRedirect(destination *url.URL, via []*http.Request) bool {
+	if !isBearerSafeUpstream(destination) {
+		return false
+	}
+	for _, priorRequest := range via {
+		if priorRequest.URL.Scheme == "https" && destination.Scheme == "http" &&
+			strings.EqualFold(priorRequest.URL.Hostname(), destination.Hostname()) {
+			// `http://127.0.0.1` is safe only when the relay and upstream began
+			// in the loopback-only trust boundary. It never permits an HTTPS
+			// same-host downgrade that would otherwise carry Authorization.
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
@@ -166,7 +217,8 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, params http
 	// The committer name is read from the PAYLOAD, and the payload is only
 	// trustworthy after the signature says so. Deciding anything on it first —
 	// including deciding to ignore it — is deciding on attacker-supplied data.
-	if len(strings.TrimSpace(p.secret)) > 0 && !provider.Validate(*hook) {
+	validated := len(strings.TrimSpace(p.secret)) > 0
+	if validated && !provider.Validate(*hook) {
 		log.Printf("Error Validating Hook for '%s'", r.URL)
 		http.Error(w, "Error validating Hook", http.StatusBadRequest)
 		return
@@ -181,12 +233,21 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, params http
 		return
 	}
 
-	resp, errs := p.redirect(hook, redirectURL)
+	var resp *http.Response
+	var errs error
+	if validated {
+		// This is the sole injection point for the relay-to-upstream credential.
+		// It is reached only after a configured provider HMAC validates.
+		resp, errs = p.redirectAuthenticated(hook, redirectURL, p.upstreamBearerToken)
+	} else {
+		resp, errs = p.redirect(hook, redirectURL)
+	}
 	if errs != nil {
 		log.Printf("Error Redirecting '%s' to upstream '%s': %s\n", r.URL, redirectURL, errs)
 		http.Error(w, "Error Redirecting '"+r.URL.String()+"' to upstream '"+redirectURL+"'", http.StatusInternalServerError)
 		return
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		log.Printf("Error Redirecting '%s' to upstream '%s', Upstream Redirect Status: %s\n", r.URL, redirectURL, resp.Status)
@@ -230,6 +291,20 @@ func (p *Proxy) Run(listenAddress string) error {
 
 func NewProxy(upstreamURL string, allowedPaths []string,
 	provider string, secret string, ignoredUsers []string) (*Proxy, error) {
+	return newProxy(upstreamURL, allowedPaths, provider, secret, ignoredUsers, "")
+}
+
+// NewProxyWithUpstreamBearerToken creates a proxy which presents a separate
+// bearer token to its upstream only after a provider HMAC validates. The
+// original NewProxy API intentionally remains available for relays which do
+// not need downstream authentication.
+func NewProxyWithUpstreamBearerToken(upstreamURL string, allowedPaths []string,
+	provider string, secret string, ignoredUsers []string, upstreamBearerToken string) (*Proxy, error) {
+	return newProxy(upstreamURL, allowedPaths, provider, secret, ignoredUsers, upstreamBearerToken)
+}
+
+func newProxy(upstreamURL string, allowedPaths []string,
+	provider string, secret string, ignoredUsers []string, upstreamBearerToken string) (*Proxy, error) {
 	// Validate Params
 	if len(strings.TrimSpace(upstreamURL)) == 0 {
 		return nil, errors.New("Cannot create Proxy with empty upstreamURL")
@@ -240,12 +315,41 @@ func NewProxy(upstreamURL string, allowedPaths []string,
 	if allowedPaths == nil {
 		return nil, errors.New("Cannot create Proxy with nil allowedPaths")
 	}
+	if strings.TrimSpace(upstreamBearerToken) != "" && strings.TrimSpace(secret) == "" {
+		return nil, errors.New("Cannot configure upstream bearer token without a webhook secret")
+	}
+	if strings.TrimSpace(upstreamBearerToken) != "" {
+		parsedUpstreamURL, err := url.Parse(upstreamURL)
+		if err != nil || !isBearerSafeUpstream(parsedUpstreamURL) {
+			return nil, errors.New("Upstream bearer token requires HTTPS or literal loopback HTTP")
+		}
+		if upstreamBearerToken == secret {
+			return nil, errors.New("Upstream bearer token must differ from the webhook secret")
+		}
+	}
 
 	return &Proxy{
-		provider:     provider,
-		upstreamURL:  upstreamURL,
-		allowedPaths: allowedPaths,
-		secret:       secret,
-		ignoredUsers: ignoredUsers,
+		provider:            provider,
+		upstreamURL:         upstreamURL,
+		allowedPaths:        allowedPaths,
+		secret:              secret,
+		upstreamBearerToken: upstreamBearerToken,
+		ignoredUsers:        ignoredUsers,
 	}, nil
+}
+
+func isBearerSafeUpstream(upstreamURL *url.URL) bool {
+	if upstreamURL == nil || upstreamURL.Host == "" || upstreamURL.User != nil ||
+		upstreamURL.RawQuery != "" || upstreamURL.Fragment != "" {
+		return false
+	}
+	if upstreamURL.Scheme == "https" {
+		return true
+	}
+	// The only HTTP exception is a literal loopback destination, used when a
+	// hardened relay and its private upstream share one process namespace. It
+	// cannot cross a network, and no alternate spelling or URL decoration is
+	// accepted.
+	return upstreamURL.Scheme == "http" &&
+		(upstreamURL.Hostname() == "127.0.0.1" || upstreamURL.Hostname() == "::1")
 }
