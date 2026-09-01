@@ -44,12 +44,13 @@ func (p *Proxy) isPathAllowed(path string) bool {
 		return true
 	}
 
-	// Check if given passed exists in allowedPaths
-	for _, p := range p.allowedPaths {
-		allowedPath := strings.TrimSpace(p)
-		incomingPath := strings.TrimSpace(path)
-		if strings.TrimSuffix(allowedPath, "/") ==
-			strings.TrimSuffix(incomingPath, "/") || strings.HasPrefix(incomingPath, allowedPath) {
+	// A configured path represents one webhook endpoint, not a route prefix.
+	// Normalise one trailing slash so deployments may configure either form
+	// without allowing sibling or nested paths such as /github-webhook/extra.
+	for _, configuredPath := range p.allowedPaths {
+		allowedPath := strings.TrimSuffix(strings.TrimSpace(configuredPath), "/")
+		incomingPath := strings.TrimSuffix(path, "/")
+		if allowedPath == incomingPath {
 			return true
 		}
 	}

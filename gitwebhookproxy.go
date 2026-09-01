@@ -1,13 +1,13 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 	"log"
 	"os"
 	"strings"
 
-	"github.com/namsral/flag"
 	"github.com/jbcom/GitWebhookProxy/pkg/proxy"
+	"github.com/namsral/flag"
 )
 
 var (
@@ -21,26 +21,23 @@ var (
 	allowedUsers  = flagSet.String("allowedUser", "", "Comma-Separated String List of users to allow while proxying Webhook request")
 )
 
-func validateRequiredFlags() {
-	isValid := true
+func validateRequiredFlags() error {
 	if len(strings.TrimSpace(*upstreamURL)) == 0 {
-		log.Println("Required flag 'upstreamURL' not specified")
-		isValid = false
+		return errors.New("required flag 'upstreamURL' not specified")
 	}
 
-	if !isValid {
-		fmt.Println("")
-		//TODO: Usage not working as expected in flagSet
-		flagSet.Usage()
-		fmt.Println("")
-
-		panic("See Flag Usage")
-	}
+	return nil
 }
 
 func main() {
-	flagSet.Parse(os.Args[1:])
-	validateRequiredFlags()
+	if err := flagSet.Parse(os.Args[1:]); err != nil {
+		log.Print(err)
+		os.Exit(2)
+	}
+	if err := validateRequiredFlags(); err != nil {
+		log.Print(err)
+		os.Exit(2)
+	}
 	lowerProvider := strings.ToLower(*provider)
 
 	// Split Comma-Separated list into an array

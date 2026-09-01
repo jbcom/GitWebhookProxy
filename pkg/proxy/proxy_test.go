@@ -218,6 +218,45 @@ func TestProxy_isPathAllowed(t *testing.T) {
 			},
 			want: true,
 		},
+		{
+			name: "isPathAllowedRejectsPrefixAndNestedPaths",
+			fields: fields{
+				provider:     providers.GithubProviderKind,
+				upstreamURL:  "https://dummyurl.com",
+				allowedPaths: []string{"/github-webhook/"},
+				secret:       "secret",
+			},
+			args: args{
+				path: "/github-webhook/extra",
+			},
+			want: false,
+		},
+		{
+			name: "isPathAllowedRejectsLookalikePrefix",
+			fields: fields{
+				provider:     providers.GithubProviderKind,
+				upstreamURL:  "https://dummyurl.com",
+				allowedPaths: []string{"/github-webhook/"},
+				secret:       "secret",
+			},
+			args: args{
+				path: "/github-webhook-evil",
+			},
+			want: false,
+		},
+		{
+			name: "isPathAllowedRejectsWhitespaceLookalike",
+			fields: fields{
+				provider:     providers.GithubProviderKind,
+				upstreamURL:  "https://dummyurl.com",
+				allowedPaths: []string{" /github-webhook/ "},
+				secret:       "secret",
+			},
+			args: args{
+				path: "/github-webhook ",
+			},
+			want: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
