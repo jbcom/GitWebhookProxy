@@ -6,7 +6,8 @@ kubernetes:
 gitWebhookProxy:
   useCustomName: false
   customName: gitlabwebhookproxy
-  # name of existing secret containing secret for hashes
+  # Existing Secret with `secret` (provider HMAC) and optional
+  # `upstreamToken` (relay-to-upstream bearer) keys.
   existingSecretName: ""
   labels:
     provider: stakater
@@ -21,6 +22,7 @@ gitWebhookProxy:
     upstreamURL: "https://jenkins.tools.stackator.com"
     allowedPaths: "/github-webhook,/project"
     secret: ""
+    upstreamToken: ""
     ignoredUsers: "stakater-user"
     allowedUsers: "myuser"
   service:

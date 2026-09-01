@@ -36,7 +36,7 @@ GitWebhookProxy can be configured by providing the following arguments either vi
 | listenAddress | Address on which the proxy listens.                                               | `:8080`  | `127.0.0.1:80`                             |
 | upstreamURL   | URL to which the proxy requests will be forwarded (required)                      |          | `https://someci-instance-url.com/webhook/` |
 | secret        | Secret of the Webhook API. If not set validation is not made.                     |          | `iamasecret`                               |
-| upstreamToken | Optional **environment-only** bearer token injected into the upstream `Authorization` header only after a configured webhook HMAC validates. Configure it as `GWP_UPSTREAMTOKEN`; do not put it in a URL, command line, log, or repository. It must not equal `secret`. | | supplied by the runtime secret manager |
+| upstreamToken | Optional **environment-only** bearer token injected into the upstream `Authorization` header only after a configured webhook HMAC validates. Configure it as `GWP_UPSTREAMTOKEN`; it requires an explicit HTTPS upstream with normal certificate and hostname verification. The sole exception is literal `http://127.0.0.1` or `http://[::1]` inside one process namespace, without userinfo/query/fragment. Do not put it in a URL, command line, log, or repository. It must not equal `secret`. | | supplied by the runtime secret manager |
 | provider      | Git Provider which generates the Webhook                                          | `github` | `github` or `gitlab`                       |
 | allowedPaths  | Comma-Separated String List of allowed paths on the proxy                         |          | `/project` or `github-webhook/,project/`   |
 | ignoredUsers  | Comma-Separated String List of users to ignore while proxying Webhook request     |          | `someuser`                                 |
@@ -72,6 +72,7 @@ Below mentioned attributes in `gitwebhookproxy.yaml` have been hard coded to run
 ```yaml
 data:
   secret: example
+  upstreamToken: example
 ```
 
 3. Change below mentioned attribute's values in `ConfigMap` in `gitwebhookproxy.yaml`
@@ -83,6 +84,10 @@ data:
   allowedPaths: /github-webhook,/project
   ignoredUsers: stakater-user
 ```
+
+`secret` and `upstreamToken` are distinct Secret keys. The latter is optional,
+but when set it is injected as `GWP_UPSTREAMTOKEN` and requires an explicit
+HTTPS `upstreamURL`; do not reuse the webhook HMAC value.
 
 #### Deploying
 

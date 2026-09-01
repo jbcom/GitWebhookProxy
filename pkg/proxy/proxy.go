@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -19,10 +18,10 @@ import (
 )
 
 var (
-	transport = &http.Transport{
-		Proxy:           http.ProxyFromEnvironment,
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
+	// Use the standard transport unchanged so HTTPS upstream connections verify
+	// both the certificate chain and hostname. A relay bearer must never cross
+	// an unverified TLS connection.
+	transport  = http.DefaultTransport.(*http.Transport).Clone()
 	httpClient = &http.Client{
 		Timeout:   time.Second * 30,
 		Transport: transport,
@@ -280,6 +279,15 @@ func newProxy(upstreamURL string, allowedPaths []string,
 	if strings.TrimSpace(upstreamBearerToken) != "" && strings.TrimSpace(secret) == "" {
 		return nil, errors.New("Cannot configure upstream bearer token without a webhook secret")
 	}
+	if strings.TrimSpace(upstreamBearerToken) != "" {
+		parsedUpstreamURL, err := url.Parse(upstreamURL)
+		if err != nil || !isBearerSafeUpstream(parsedUpstreamURL) {
+			return nil, errors.New("Upstream bearer token requires HTTPS or literal loopback HTTP")
+		}
+		if upstreamBearerToken == secret {
+			return nil, errors.New("Upstream bearer token must differ from the webhook secret")
+		}
+	}
 
 	return &Proxy{
 		provider:            provider,
@@ -289,4 +297,20 @@ func newProxy(upstreamURL string, allowedPaths []string,
 		upstreamBearerToken: upstreamBearerToken,
 		ignoredUsers:        ignoredUsers,
 	}, nil
+}
+
+func isBearerSafeUpstream(upstreamURL *url.URL) bool {
+	if upstreamURL == nil || upstreamURL.Host == "" || upstreamURL.User != nil ||
+		upstreamURL.RawQuery != "" || upstreamURL.Fragment != "" {
+		return false
+	}
+	if upstreamURL.Scheme == "https" {
+		return true
+	}
+	// The only HTTP exception is a literal loopback destination, used when a
+	// hardened relay and its private upstream share one process namespace. It
+	// cannot cross a network, and no alternate spelling or URL decoration is
+	// accepted.
+	return upstreamURL.Scheme == "http" &&
+		(upstreamURL.Hostname() == "127.0.0.1" || upstreamURL.Hostname() == "::1")
 }

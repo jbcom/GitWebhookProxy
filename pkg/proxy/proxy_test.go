@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	httpmock "github.com/jarcoal/httpmock"
 	"github.com/jbcom/GitWebhookProxy/pkg/providers"
@@ -513,6 +516,17 @@ func createSignedGithubRequest(method string, path, eventHeader, secret string, 
 	return req
 }
 
+func trustTestTLSUpstream(t *testing.T, upstream *httptest.Server) {
+	t.Helper()
+	roots := x509.NewCertPool()
+	roots.AddCert(upstream.Certificate())
+	trustedTransport := transport.Clone()
+	trustedTransport.TLSClientConfig = &tls.Config{RootCAs: roots}
+	previousClient := httpClient
+	httpClient = &http.Client{Timeout: time.Second * 30, Transport: trustedTransport}
+	t.Cleanup(func() { httpClient = previousClient })
+}
+
 func TestProxy_proxyRequestInjectsUpstreamBearerOnlyAfterValidHMAC(t *testing.T) {
 	const upstreamBearerToken = "jenkins-relay-test-token"
 	payload := []byte(`{"sender":{"login":"trusted-sender"}}`)
@@ -522,7 +536,7 @@ func TestProxy_proxyRequestInjectsUpstreamBearerOnlyAfterValidHMAC(t *testing.T)
 		rawQuery      string
 	}
 	received := make(chan upstreamRequest, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		received <- upstreamRequest{
 			authorization: r.Header.Get("Authorization"),
 			rawQuery:      r.URL.RawQuery,
@@ -530,6 +544,7 @@ func TestProxy_proxyRequestInjectsUpstreamBearerOnlyAfterValidHMAC(t *testing.T)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
+	trustTestTLSUpstream(t, upstream)
 
 	p, err := NewProxyWithUpstreamBearerToken(
 		upstream.URL,
@@ -575,11 +590,12 @@ func TestProxy_proxyRequestRejectsInvalidHMACWithoutBearerOrLeak(t *testing.T) {
 	payload := []byte(`{"sender":{"login":"attacker"}}`)
 
 	upstreamCalls := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
+	trustTestTLSUpstream(t, upstream)
 
 	p, err := NewProxyWithUpstreamBearerToken(
 		upstream.URL,
@@ -624,13 +640,14 @@ func TestProxy_proxyRequestRedactsBearerWhenUpstreamFails(t *testing.T) {
 	const upstreamBearerToken = "jenkins-relay-test-token"
 	payload := []byte(`{"sender":{"login":"trusted-sender"}}`)
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+upstreamBearerToken {
 			t.Errorf("upstream Authorization = %q, want exact bearer token", r.Header.Get("Authorization"))
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer upstream.Close()
+	trustTestTLSUpstream(t, upstream)
 
 	p, err := NewProxyWithUpstreamBearerToken(
 		upstream.URL,
@@ -682,6 +699,119 @@ func TestNewProxyWithUpstreamBearerTokenRequiresWebhookHMAC(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "jenkins-relay-test-token") {
 		t.Fatalf("configuration error leaked downstream bearer token: %v", err)
+	}
+}
+
+func TestNewProxyWithUpstreamBearerTokenRequiresExplicitHTTPS(t *testing.T) {
+	for _, upstreamURL := range []string{
+		"http://jenkins.example.test",
+		"jenkins.example.test",
+		"//jenkins.example.test",
+		"http://localhost:8080/jenkins",
+		"http://127.0.0.1.evil.test:8080/jenkins",
+		"http://127.0.0.1:8080/jenkins?token=forbidden",
+		"http://127.0.0.1:8080/jenkins#forbidden",
+		"http://user@127.0.0.1:8080/jenkins",
+	} {
+		t.Run(upstreamURL, func(t *testing.T) {
+			_, err := NewProxyWithUpstreamBearerToken(
+				upstreamURL,
+				[]string{"/generic-webhook-trigger/invoke"},
+				providers.GithubProviderKind,
+				proxyGithubTestSecret,
+				nil,
+				"jenkins-relay-test-token",
+			)
+			if err == nil {
+				t.Fatalf("non-HTTPS upstream %q was accepted for a bearer relay", upstreamURL)
+			}
+			if strings.Contains(err.Error(), "jenkins-relay-test-token") || strings.Contains(err.Error(), proxyGithubTestSecret) {
+				t.Fatalf("HTTPS validation error leaked a credential: %v", err)
+			}
+		})
+	}
+}
+
+func TestNewProxyWithUpstreamBearerTokenAllowsOnlyLiteralLoopbackHTTP(t *testing.T) {
+	for _, upstreamURL := range []string{
+		"http://127.0.0.1:8080/jenkins",
+		"http://[::1]:8080/jenkins",
+	} {
+		t.Run(upstreamURL, func(t *testing.T) {
+			_, err := NewProxyWithUpstreamBearerToken(
+				upstreamURL,
+				[]string{"/generic-webhook-trigger/invoke"},
+				providers.GithubProviderKind,
+				proxyGithubTestSecret,
+				nil,
+				"jenkins-relay-test-token",
+			)
+			if err != nil {
+				t.Fatalf("literal loopback HTTP upstream %q was rejected: %v", upstreamURL, err)
+			}
+		})
+	}
+}
+
+func TestNewProxyWithUpstreamBearerTokenRejectsWebhookSecretReuse(t *testing.T) {
+	_, err := NewProxyWithUpstreamBearerToken(
+		"https://jenkins.example.test",
+		[]string{"/generic-webhook-trigger/invoke"},
+		providers.GithubProviderKind,
+		proxyGithubTestSecret,
+		nil,
+		proxyGithubTestSecret,
+	)
+	if err == nil {
+		t.Fatal("webhook HMAC secret reuse as an upstream bearer was accepted")
+	}
+	if strings.Contains(err.Error(), proxyGithubTestSecret) {
+		t.Fatalf("credential-separation error leaked a secret: %v", err)
+	}
+}
+
+func TestProxy_proxyRequestRejectsUntrustedTLSUpstreamForBearerRelay(t *testing.T) {
+	const upstreamBearerToken = "jenkins-relay-test-token"
+	payload := []byte(`{"sender":{"login":"trusted-sender"}}`)
+
+	upstreamCalls := 0
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	p, err := NewProxyWithUpstreamBearerToken(
+		upstream.URL,
+		[]string{"/generic-webhook-trigger/invoke"},
+		providers.GithubProviderKind,
+		proxyGithubTestSecret,
+		nil,
+		upstreamBearerToken,
+	)
+	if err != nil {
+		t.Fatalf("NewProxyWithUpstreamBearerToken() error = %v", err)
+	}
+
+	router := httprouter.New()
+	router.POST("/*path", p.proxyRequest)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, createSignedGithubRequest(
+		http.MethodPost,
+		"/generic-webhook-trigger/invoke",
+		proxyGithubTestEvent,
+		proxyGithubTestSecret,
+		payload,
+	))
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("untrusted TLS upstream status = %d, want %d", rr.Code, http.StatusInternalServerError)
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("untrusted TLS upstream received %d bearer relay requests", upstreamCalls)
+	}
+	if strings.Contains(rr.Body.String(), upstreamBearerToken) {
+		t.Fatal("untrusted TLS failure leaked the downstream bearer token")
 	}
 }
 
