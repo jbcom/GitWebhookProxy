@@ -26,6 +26,7 @@ var (
 		Timeout:   time.Second * 30,
 		Transport: transport,
 	}
+	errUnsafeBearerRedirect = errors.New("redirect target is not a bearer-safe upstream")
 )
 
 type Proxy struct {
@@ -118,13 +119,51 @@ func (p *Proxy) redirectAuthenticated(hook *providers.Hook, redirectURL, bearerT
 		req.Header.Add(key, value)
 	}
 	if bearerToken != "" {
+		if !isBearerSafeUpstream(url) {
+			return nil, errUnsafeBearerRedirect
+		}
 		// Set rather than Add so an untrusted inbound Authorization value cannot
 		// survive parser changes and take precedence at the upstream.
 		req.Header.Set("Authorization", "Bearer "+bearerToken)
+		return bearerSafeHTTPClient().Do(req)
 	}
 
 	return httpClient.Do(req)
 
+}
+
+// bearerSafeHTTPClient rejects a redirect before the destination receives a
+// request when it is not a bearer-safe upstream. The initial request is
+// validated in redirectAuthenticated; CheckRedirect covers every later hop.
+func bearerSafeHTTPClient() *http.Client {
+	client := *httpClient
+	previousCheckRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !isBearerSafeRedirect(req.URL, via) {
+			return errUnsafeBearerRedirect
+		}
+		if previousCheckRedirect != nil {
+			return previousCheckRedirect(req, via)
+		}
+		return nil
+	}
+	return &client
+}
+
+func isBearerSafeRedirect(destination *url.URL, via []*http.Request) bool {
+	if !isBearerSafeUpstream(destination) {
+		return false
+	}
+	for _, priorRequest := range via {
+		if priorRequest.URL.Scheme == "https" && destination.Scheme == "http" &&
+			strings.EqualFold(priorRequest.URL.Hostname(), destination.Hostname()) {
+			// `http://127.0.0.1` is safe only when the relay and upstream began
+			// in the loopback-only trust boundary. It never permits an HTTPS
+			// same-host downgrade that would otherwise carry Authorization.
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, params httprouter.Params) {

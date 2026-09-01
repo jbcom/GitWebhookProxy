@@ -59,6 +59,15 @@ func TestBearerRelayValueIsSecretOnlyAndDocumented(t *testing.T) {
 	}
 }
 
+func TestExistingSecretCanOmitTheDisabledBearerToken(t *testing.T) {
+	deployment := readRenderContractFile(t, "chart/gitwebhookproxy/templates/deployment.yaml")
+	upstreamTokenRef := strings.SplitN(deployment, "key: upstreamToken", 2)
+	if len(upstreamTokenRef) != 2 || !strings.Contains(upstreamTokenRef[1], "existingSecretName") ||
+		!strings.Contains(upstreamTokenRef[1], "optional: true") {
+		t.Fatal("existingSecretName must permit an HMAC-only Secret when bearer injection is disabled")
+	}
+}
+
 func readRenderContractFile(t *testing.T, relativePath string) string {
 	t.Helper()
 	source, err := os.ReadFile(filepath.Clean(relativePath))

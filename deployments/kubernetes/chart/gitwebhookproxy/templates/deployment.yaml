@@ -97,6 +97,9 @@ spec:
               key: upstreamToken
             {{- if .Values.gitWebhookProxy.existingSecretName }}
               name: {{ .Values.gitWebhookProxy.existingSecretName }}
+              # A legacy externally managed Secret may only contain the
+              # webhook HMAC. An absent bearer leaves relay injection disabled.
+              optional: true
             {{- else if .Values.gitWebhookProxy.useCustomName }}
               name: {{ .Values.gitWebhookProxy.customName }}
             {{- else }}
