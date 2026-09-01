@@ -49,7 +49,7 @@ func (p *Proxy) isPathAllowed(path string) bool {
 	// without allowing sibling or nested paths such as /github-webhook/extra.
 	for _, configuredPath := range p.allowedPaths {
 		allowedPath := strings.TrimSuffix(strings.TrimSpace(configuredPath), "/")
-		incomingPath := strings.TrimSuffix(strings.TrimSpace(path), "/")
+		incomingPath := strings.TrimSuffix(path, "/")
 		if allowedPath == incomingPath {
 			return true
 		}
