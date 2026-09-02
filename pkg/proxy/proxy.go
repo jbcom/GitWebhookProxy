@@ -346,10 +346,39 @@ func isBearerSafeUpstream(upstreamURL *url.URL) bool {
 	if upstreamURL.Scheme == "https" {
 		return true
 	}
-	// The only HTTP exception is a literal loopback destination, used when a
-	// hardened relay and its private upstream share one process namespace. It
-	// cannot cross a network, and no alternate spelling or URL decoration is
-	// accepted.
-	return upstreamURL.Scheme == "http" &&
-		(upstreamURL.Hostname() == "127.0.0.1" || upstreamURL.Hostname() == "::1")
+	// Two HTTP exceptions, each a destination the bearer cannot leave a
+	// trusted boundary to reach. A literal loopback address is used when a
+	// hardened relay and its private upstream share one process namespace; it
+	// cannot cross a network. A `*.railway.internal` name resolves only inside
+	// one Railway project's private network, which is WireGuard-encrypted
+	// between services and unreachable from outside it — the relay and its
+	// upstream are separate services there by design (a public listener must
+	// not share a container with the credentials behind it), so this is the
+	// same boundary as loopback expressed across two containers. No alternate
+	// spelling or URL decoration is accepted for either.
+	if upstreamURL.Scheme != "http" {
+		return false
+	}
+	host := upstreamURL.Hostname()
+	return host == "127.0.0.1" || host == "::1" || isRailwayPrivateHost(host)
+}
+
+// isRailwayPrivateHost reports whether host is a name in Railway's private
+// networking zone: a bare label under `railway.internal`, lowercase, with no
+// trailing dot and no attempt to smuggle the suffix inside a longer name.
+func isRailwayPrivateHost(host string) bool {
+	const zone = ".railway.internal"
+	if !strings.HasSuffix(host, zone) || host != strings.ToLower(host) {
+		return false
+	}
+	label := strings.TrimSuffix(host, zone)
+	if label == "" || strings.Contains(label, ".") {
+		return false
+	}
+	for _, r := range label {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-') {
+			return false
+		}
+	}
+	return true
 }
