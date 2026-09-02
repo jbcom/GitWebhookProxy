@@ -834,10 +834,43 @@ func TestNewProxyWithUpstreamBearerTokenRequiresExplicitHTTPS(t *testing.T) {
 	}
 }
 
+func TestNewProxyWithUpstreamBearerTokenRejectsLookalikeRailwayPrivateHosts(t *testing.T) {
+	// The private-zone exception is a whole-name match, not a suffix search:
+	// a public host that merely contains or ends near the zone, an uppercase
+	// spelling, a trailing dot, or a nested label must all stay rejected.
+	for _, upstreamURL := range []string{
+		"http://ci-jenkins-controller.railway.internal.example.com:8080/jenkins",
+		"http://railway.internal:8080/jenkins",
+		"http://CI-JENKINS-CONTROLLER.RAILWAY.INTERNAL:8080/jenkins",
+		"http://ci-jenkins-controller.railway.internal.:8080/jenkins",
+		"http://evil.ci-jenkins-controller.railway.internal:8080/jenkins",
+		"http://ci_jenkins.railway.internal:8080/jenkins",
+		"http://user@ci-jenkins-controller.railway.internal:8080/jenkins",
+		"http://ci-jenkins-controller.railway.internal:8080/jenkins?token=x",
+	} {
+		t.Run(upstreamURL, func(t *testing.T) {
+			_, err := NewProxyWithUpstreamBearerToken(
+				upstreamURL,
+				[]string{"/generic-webhook-trigger/invoke"},
+				providers.GithubProviderKind,
+				proxyGithubTestSecret,
+				nil,
+				"jenkins-relay-test-token",
+			)
+			if err == nil {
+				t.Fatalf("lookalike private upstream %q was accepted for a bearer relay", upstreamURL)
+			}
+		})
+	}
+}
+
 func TestNewProxyWithUpstreamBearerTokenAllowsOnlyLiteralLoopbackHTTP(t *testing.T) {
 	for _, upstreamURL := range []string{
 		"http://127.0.0.1:8080/jenkins",
 		"http://[::1]:8080/jenkins",
+		// Railway's private networking zone: only resolvable inside one
+		// project's WireGuard-encrypted private network.
+		"http://ci-jenkins-controller.railway.internal:8080/jenkins",
 	} {
 		t.Run(upstreamURL, func(t *testing.T) {
 			_, err := NewProxyWithUpstreamBearerToken(
